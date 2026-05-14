@@ -5,7 +5,7 @@ Script Python per generare preventivi Excel automatizzando il matching tra descr
 ## Setup
 
 ```bash
-pip install -r requirements.txt
+pip3 install -r requirements.txt
 ```
 
 ## Utilizzo
