@@ -257,6 +257,9 @@ def _build_workbook_zip(
             # Rimuovi stile s="..." dalle celle vuote dell'header che causano bordi
             content = _clear_cell_style(content, 'D3')
             content = _clear_cell_style(content, 'D4')
+            content = _clear_cell_style(content, 'D5')
+            content = _clear_cell_style(content, 'D6')
+            content = _clear_cell_style(content, 'D7')
             content = _clear_cell_style(content, 'G5')
             content = _clear_cell_style(content, 'G6')
             content = _clear_cell_style(content, 'G7')
