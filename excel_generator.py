@@ -3,6 +3,10 @@
 from pathlib import Path
 from datetime import date
 from typing import List, Optional
+import zipfile
+import re
+import shutil
+
 import openpyxl
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
@@ -19,6 +23,11 @@ from config import (
     CELL_TOTALE,
 )
 from models import Lavoro, MatchResult
+
+
+# Content type: template (.xltx) vs file normale (.xlsx)
+TEMPLATE_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml'
+SHEET_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml'
 
 
 def ensure_output_dir() -> Path:
@@ -91,7 +100,34 @@ def genera_preventivo(
     output_path = output_dir / filename
     
     wb.save(output_path)
+    
+    # Correzione content type: da template.main+xml a sheet.main+xml
+    _fix_content_type(output_path)
+    
     return output_path
+
+
+def _fix_content_type(xlsx_path: Path):
+    """Corregg e il content type del workbook da template a sheet.
+    
+    Il template .xltx ha content type 'template.main+xml' che Excel non accetta
+    per file .xlsx normali. Questa funzione lo corregge.
+    """
+    temp_path = xlsx_path.with_suffix('.temp.xlsx')
+    
+    with zipfile.ZipFile(xlsx_path, 'r') as zin:
+        with zipfile.ZipFile(temp_path, 'w', zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                
+                if item.filename == '[Content_Types].xml':
+                    content = data.decode('utf-8')
+                    content = content.replace(TEMPLATE_CONTENT_TYPE, SHEET_CONTENT_TYPE)
+                    data = content.encode('utf-8')
+                
+                zout.writestr(item, data)
+    
+    shutil.move(str(temp_path), str(xlsx_path))
 
 
 def _compile_lavoro_sheet(ws: Worksheet, lavoro: Lavoro, match_result: Optional[MatchResult]):
