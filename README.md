@@ -12,19 +12,19 @@ pip install -r requirements.txt
 
 ```bash
 # Milano (default)
-python genera_preventivi.py --input nuovi_lavori.csv --template milano
+python3 genera_preventivi.py --input nuovi_lavori.csv --template milano
 
 # Liguria
-python genera_preventivi.py --input nuovi_lavori.csv --template liguria
+python3 genera_preventivi.py --input nuovi_lavori.csv --template liguria
 
 # Con AI fallback
-python genera_preventivi.py --input nuovi_lavori.csv --template milano --use-ai
+python3 genera_preventivi.py --input nuovi_lavori.csv --template milano --use-ai
 
 # Help
-python genera_preventivi.py --help
+python3 genera_preventivi.py --help
 
 # Verbose
-python genera_preventivi.py --input nuovi_lavori.csv --verbose
+python3 genera_preventivi.py --input nuovi_lavori.csv --verbose
 ```
 
 ## Output
