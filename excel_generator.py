@@ -20,10 +20,42 @@ from config import (
 )
 from models import Lavoro, MatchResult
 
-
 # Content type: template (.xltx) vs file normale (.xlsx)
 TEMPLATE_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml'
 SHEET_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml'
+
+# Shared strings cache (caricato dal template)
+SHARED_STRINGS: list[str] = []
+
+
+def _load_shared_strings(ss_xml_data: bytes) -> list[str]:
+    """Carica le shared strings dal template.
+    
+    Le shared strings sono usate per memorizzare testo ripetuto nelle celle.
+    Ogni cella con t="s" contiene un indice a questa lista.
+    """
+    if not ss_xml_data:
+        return []
+    
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(ss_xml_data)
+        ns = {'ns': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+        strings = []
+        for si in root.findall('ns:si', ns):
+            t = si.find('ns:t', ns)
+            if t is not None and t.text:
+                strings.append(t.text)
+            else:
+                # Handle rich text
+                texts = []
+                for r in si.findall('.//ns:t', ns):
+                    if r.text:
+                        texts.append(r.text)
+                strings.append(''.join(texts) if texts else '')
+        return strings
+    except ET.ParseError:
+        return []
 
 
 def ensure_output_dir() -> Path:
@@ -91,6 +123,10 @@ def _build_workbook_zip(
         template_files = {}
         for name in ztemplate.namelist():
             template_files[name] = ztemplate.read(name)
+        
+        # Carica shared strings per la ricerca dei codici elanco
+        global SHARED_STRINGS
+        SHARED_STRINGS = _load_shared_strings(template_files.get('xl/sharedStrings.xml', b''))
     
     # Prepara i dati per ogni lavoro
     sheet_data_list = []
@@ -214,7 +250,25 @@ def _build_workbook_zip(
     
     new_files['[Content_Types].xml'] = content_types.encode('utf-8')
     
-    # 6. Scrivi il nuovo ZIP
+    # 6. Rimuovi stili indesiderati dalle celle compilabili dell'header
+    for filename in list(new_files.keys()):
+        if filename.startswith('xl/worksheets/sheet') and filename.endswith('.xml'):
+            content = new_files[filename].decode('utf-8')
+            # Rimuovi stile s="..." dalle celle vuote dell'header che causano bordi
+            content = _clear_cell_style(content, 'D3')
+            content = _clear_cell_style(content, 'D4')
+            content = _clear_cell_style(content, 'G5')
+            content = _clear_cell_style(content, 'G6')
+            content = _clear_cell_style(content, 'G7')
+            new_files[filename] = content.encode('utf-8')
+    
+    # 7. Popola il foglio Totale (sheet2.xml) con le righe dei lavori
+    if 'xl/worksheets/sheet2.xml' in template_files:
+        totale_xml = template_files['xl/worksheets/sheet2.xml'].decode('utf-8')
+        totale_xml = _add_totale_rows(totale_xml, sheet_data_list)
+        new_files['xl/worksheets/sheet2.xml'] = totale_xml.encode('utf-8')
+    
+    # 7. Scrivi il nuovo ZIP
     temp_path = output_path.with_suffix('.build.xlsx')
     with zipfile.ZipFile(temp_path, 'w', zipfile.ZIP_DEFLATED) as zout:
         for filename, data in new_files.items():
@@ -257,77 +311,257 @@ def _modify_sheet_xml(sheet_xml: str, data: dict) -> str:
 
 
 def _set_cell_value(sheet_xml: str, cell_ref: str, value) -> str:
-    """Imposta il valore di una cella nel foglio XML."""
+    """Imposta il valore di una cella nel foglio XML.
+    
+    Preserva formule esistenti (<f>) e attributi della cella.
+    """
     if value is None:
         return sheet_xml
     
     str_value = str(value)
     
-    # Cerca la cella esistente
-    cell_pattern = rf'(<c r="{re.escape(cell_ref)}"[^>]*>)(.*?)(</c>)'
-    cell_match = re.search(cell_pattern, sheet_xml, re.DOTALL)
+    # Strategy: First check for self-closing cells (<c ... />), 
+    # then for cells with content (<c ...>...</c>).
+    # IMPORTANT: Self-closing pattern must be checked first because
+    # non-self-closing regex can incorrectly match across cells.
     
-    if cell_match:
-        open_tag = cell_match.group(1)
+    # Check for self-closing cell first
+    self_closing_pattern = rf'<c r="{re.escape(cell_ref)}"([^>]*)/>'
+    self_closing_match = re.search(self_closing_pattern, sheet_xml)
+    
+    if self_closing_match:
+        # Convert self-closing to cell with value
+        attrs = self_closing_match.group(1)
+        self_closing = self_closing_match.group(0)
+        open_tag = f'<c r="{cell_ref}"{attrs}>'
         
-        # Estrai lo style se presente
+        # Estrai attributi
+        t_match = re.search(r't="([^"]+)"', open_tag)
         style_match = re.search(r's="(\d+)"', open_tag)
-        style_attr = f' s="{style_match.group(1)}"' if style_match else ''
+        existing_type = t_match.group(1) if t_match else None
+        existing_style = f' s="{style_match.group(1)}"' if style_match else ''
         
-        # Determina il tipo: numerico per numeri, string per testo
+        # Costruisci nuova cella
         if isinstance(value, (int, float)):
-            new_tag = f'<c r="{cell_ref}"{style_attr}><v>{str_value}</v></c>'
+            new_inner = f'<v>{str_value}</v>'
         else:
-            # Per stringhe, usa t="str" per string inline
-            new_tag = f'<c r="{cell_ref}"{style_attr} t="str"><v>{str_value}</v></c>'
+            type_attr = ' t="str"' if not existing_type else ''
+            new_inner = f'<v>{str_value}</v>'
         
-        # Sostituisci
-        old_cell = cell_match.group(0)
-        sheet_xml = sheet_xml.replace(old_cell, new_tag)
-    else:
-        # La cella non esiste - inseriscila nella riga corretta
-        row_num = int(re.search(r'(\d+)', cell_ref).group(1))
+        new_cell = f'<c r="{cell_ref}"{existing_style}{type_attr if not isinstance(value, (int, float)) else ""}>{new_inner}</c>'
+        sheet_xml = sheet_xml.replace(self_closing, new_cell, 1)  # Replace only first occurrence
+        return sheet_xml
+    
+    # Now check for non-self-closing cell with content
+    # Use a more precise pattern that matches only the specific cell
+    # Pattern: <c r="CELLREF" ... > content </c>
+    # Must be careful not to match across cell boundaries
+    non_self_pattern = rf'<c r="{re.escape(cell_ref)}"([^>]*)>'
+    non_self_match = re.search(non_self_pattern, sheet_xml)
+    
+    if non_self_match:
+        # Find the closing </c> after this opening tag
+        # Use a non-greedy match that stops at the first </c>
+        start_pos = non_self_match.end()  # Position after opening tag
         
-        new_cell = f'<c r="{cell_ref}"><v>{str_value}</v></c>'
+        # Find the closing tag - search forward from start_pos
+        close_pos = sheet_xml.find('</c>', start_pos)
+        if close_pos == -1:
+            return sheet_xml  # No closing tag, shouldn't happen
         
-        # Trova la riga
-        row_pattern = rf'(<row[^>]*r="{row_num}"[^>]*>)(.*?)(</row>)'
-        row_match = re.search(row_pattern, sheet_xml, re.DOTALL)
+        # Extract the full cell content
+        open_tag_content = non_self_match.group(1)  # Attributes between r and >
+        cell_content = sheet_xml[start_pos:close_pos]
         
-        if row_match:
-            row_open = row_match.group(1)
-            row_content = row_match.group(2)
-            row_close = row_match.group(3)
-            
-            new_row_content = row_content + new_cell
-            new_row = row_open + new_row_content + row_close
-            
-            sheet_xml = sheet_xml.replace(row_match.group(0), new_row)
+        # Build replacement
+        t_match = re.search(r't="([^"]+)"', non_self_match.group(0))
+        style_match = re.search(r's="(\d+)"', non_self_match.group(0))
+        existing_type = t_match.group(1) if t_match else None
+        existing_style = f' s="{style_match.group(1)}"' if style_match else ''
+        
+        # Check if cell has formula
+        has_formula = '<f' in cell_content and '</f>' in cell_content
+        
+        if has_formula:
+            # Preserve formula, update value
+            formula_match = re.search(r'<f[^>]*>.*?</f>', cell_content, re.DOTALL)
+            formula = formula_match.group(0) if formula_match else ''
+            new_inner = f'{formula}<v>{str_value}</v>'
+        else:
+            # No formula - just set value
+            if isinstance(value, (int, float)):
+                new_inner = f'<v>{str_value}</v>'
+            else:
+                type_attr = ' t="str"' if not existing_type else ''
+                new_inner = f'<v>{str_value}</v>'
+        
+        old_cell = f'<c r="{cell_ref}"{open_tag_content}>{cell_content}</c>'
+        new_cell = f'<c r="{cell_ref}"{existing_style}{' t="str"' if not isinstance(value, (int, float)) and not existing_type else ''}>{new_inner}</c>'
+        
+        sheet_xml = sheet_xml.replace(old_cell, new_cell, 1)
+        return sheet_xml
+    
+    # Cell doesn't exist - insert it
+    row_num = int(re.search(r'(\d+)', cell_ref).group(1))
+    new_cell = f'<c r="{cell_ref}"><v>{str_value}</v></c>'
+    
+    # Find the row
+    row_pattern = rf'(<row[^>]*r="{row_num}"[^>]*>)(.*?)(</row>)'
+    row_match = re.search(row_pattern, sheet_xml, re.DOTALL)
+    
+    if row_match:
+        row_content = row_match.group(2)
+        new_row_content = row_content + new_cell
+        new_row = row_match.group(1) + new_row_content + row_match.group(3)
+        sheet_xml = sheet_xml.replace(row_match.group(0), new_row)
     
     return sheet_xml
 
 
 def _insert_quantita_in_sheet(sheet_xml: str, codice_elanco: str, quantita: int) -> str:
-    """Trova la riga con il codice elanco e inserisci la quantità nella colonna D."""
-    # Cerca la cella in colonna C che contiene il codice elanco
-    pattern = rf'<c r="C(\d+)"[^>]*>.*?<v>[^<]*' + re.escape(codice_elanco) + r'[^<]*</v>.*?</c>'
-    match = re.search(pattern, sheet_xml, re.DOTALL)
+    """Trova la riga con il codice elanco e inserisci la quantità nella colonna D.
     
-    if match:
+    I codici elanco sono in colonna C del template (colonna "Cod.Elenco" nel template).
+    La quantità viene inserita nella colonna D della stessa riga.
+    """
+    # Cerca la cella in colonna C che contiene il codice elanco (tramite shared string)
+    # Le celle C hanno t="s" (shared string) e contengono l'indice nella shared strings table
+    
+    # Pattern: cerca <c r="C{N}" ... t="s"><v>{INDEX}</v></c>
+    c_cell_pattern = r'<c r="C(\d+)"[^>]*t="s"[^>]*><v>(\d+)</v></c>'
+    
+    # Prima passata: cerca la riga che contiene il codice elanco
+    found_row = None
+    
+    for match in re.finditer(c_cell_pattern, sheet_xml):
         row_num = int(match.group(1))
-        sheet_xml = _set_cell_value(sheet_xml, f'D{row_num}', quantita)
-    else:
-        # Fallback: trova tutte le celle C con contenuto simile
-        all_c_cells = re.findall(r'<c r="C(\d+)"', sheet_xml)
-        for row_num_str in all_c_cells:
-            row_num = int(row_num_str)
-            cell_pattern = rf'<c r="C{row_num}"[^>]*>.*?<v>([^<]*)</v>.*?</c>'
-            cell_match = re.search(cell_pattern, sheet_xml, re.DOTALL)
-            if cell_match and codice_elanco in cell_match.group(1):
-                sheet_xml = _set_cell_value(sheet_xml, f'D{row_num}', quantita)
+        str_index = int(match.group(2))
+        
+        # Verifica se il contenuto della shared string corrisponde al codice elanco
+        if str_index < len(SHARED_STRINGS):
+            shared_str = SHARED_STRINGS[str_index]
+            if codice_elanco == shared_str or codice_elanco.upper() == shared_str.upper():
+                found_row = row_num
                 break
     
+    # Se non trovato con match esatto, prova ricerca case-insensitive
+    if found_row is None:
+        for match in re.finditer(c_cell_pattern, sheet_xml):
+            row_num = int(match.group(1))
+            str_index = int(match.group(2))
+            
+            if str_index < len(SHARED_STRINGS):
+                shared_str = SHARED_STRINGS[str_index]
+                if codice_elanco.upper() in shared_str.upper() or shared_str.upper() in codice_elanco.upper():
+                    found_row = row_num
+                    break
+    
+    if found_row:
+        # Inserisci/aggiorna la quantità nella colonna D della stessa riga
+        sheet_xml = _set_cell_value(sheet_xml, f'D{found_row}', quantita)
+    else:
+        # Log per debug: codice non trovato
+        import sys
+        print(f"DEBUG: Codice elanco '{codice_elanco}' non trovato nel foglio. SHARED_STRINGS ha {len(SHARED_STRINGS)} elementi", file=sys.stderr)
+    
     return sheet_xml
+
+
+def _clear_cell_style(sheet_xml: str, cell_ref: str) -> str:
+    """Rimuove lo stile da una cella, mantenendo solo r e t attribute.
+    
+    Questo elimina bordi/sfondi indesiderati dalle celle compilabili.
+    """
+    # Pattern per trovare la cella e rimuovere s="..." dal tag di apertura
+    cell_pattern = rf'<c r="{re.escape(cell_ref)}"([^>]*)'
+    
+    def fix_cell(match):
+        attrs = match.group(1)
+        # Rimuovi s="..." mantenendo altri attributi
+        attrs_no_style = re.sub(r's="[^"]*"\s*', '', attrs)
+        return f'<c r="{cell_ref}"{attrs_no_style}'
+    
+    sheet_xml = re.sub(cell_pattern, fix_cell, sheet_xml)
+    return sheet_xml
+
+
+def _add_totale_rows(totale_xml: str, sheet_data_list: list) -> str:
+    """Aggiunge righe al foglio Totale con i dati dei lavori.
+    
+    Ogni riga contiene:
+    - B: codice lavoro
+    - C: data esecuzione
+    - D: riferimento al foglio lavoro (es: ='COD001'!I8)
+    
+    Le righe vengono aggiunte dopo la riga 3 (le prime 3 righe sono header).
+    """
+    # Trova l'ultima riga esistente nel foglio
+    row_pattern = r'<row r="(\d+)"'
+    existing_rows = list(re.finditer(row_pattern, totale_xml))
+    
+    # L'ultima riga usata è la 25 (B25, C25, D25) nel template base
+    # Aggiungiamo le nuove righe dopo la riga 2 (riga header) o l'ultima esistente
+    start_row = 3  # Partiamo dalla riga 3 per i dati
+    
+    # Costruisci le righe XML per ogni lavoro
+    new_rows_xml = ''
+    
+    for i, data in enumerate(sheet_data_list):
+        row_num = start_row + i
+        codice = data['codice']
+        data_esec = data['data_esecuzione']
+        
+        # Riferimento al foglio lavoro: ='COD001'!I8
+        # I8 è la cella del totale nel foglio lavoro
+        sheet_ref = f"'{codice}'!I8"
+        
+        # Stile per le celle (usa gli stili esistenti dalla riga 3 del template)
+        # B: s="124", C: s="125", D: s="126"
+        # Cella B: codice (stringa)
+        # Cella C: data esecuzione
+        # Cella D: formula riferimento
+        
+        # Formatta la data in formato Excel (seriale)
+        # Le date nel template sono trattate come seriali
+        data_formatted = _format_date_for_excel(data_esec)
+        
+        row_xml = f'''<row r="{row_num}" customFormat="false" ht="15.75" hidden="false" customHeight="false" outlineLevel="0" collapsed="false">
+<c r="B{row_num}" s="124" t="str"><v>{codice}</v></c>
+<c r="C{row_num}" s="125"><v>{data_formatted}</v></c>
+<c r="D{row_num}" s="126" t="str"><v>{sheet_ref}</v></c>
+</row>'''
+        new_rows_xml += row_xml
+    
+    # Inserisci le nuove righe prima di </sheetData>
+    totale_xml = totale_xml.replace('</sheetData>', new_rows_xml + '</sheetData>')
+    
+    return totale_xml
+
+
+def _format_date_for_excel(date_str: str) -> str:
+    """Converte una stringa data in numero seriale Excel.
+    
+    Excel memorizza le date come numero di giorni dal 1/1/1900.
+    """
+    from datetime import date, datetime
+    
+    if date_str is None:
+        return ""
+    
+    try:
+        # Prova diversi formati data
+        for fmt in ('%d/%m/%Y', '%Y-%m-%d', '%d-%m-%Y', '%Y/%m/%d'):
+            try:
+                dt = datetime.strptime(date_str, fmt)
+                # Calcola il numero seriale (giorni dal 1/1/1900 + 1 per bug Excel)
+                excel_epoch = date(1900, 1, 1)
+                delta = (dt.date() - excel_epoch).days + 2
+                return str(delta)
+            except ValueError:
+                continue
+        return date_str  # Ritorna originale se non parseable
+    except Exception:
+        return date_str
 
 
 def _fix_content_type(xlsx_path: Path):
