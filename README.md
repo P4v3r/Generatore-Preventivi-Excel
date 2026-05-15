@@ -5,13 +5,19 @@ Script Python per generare preventivi Excel automatizzando il matching tra descr
 ## Setup
 
 ```bash
+# Installa Dipendenze
 pip install -r requirements.txt
+```
+
+```bash
+# Attiva l'ambiente virtuale all'interno della cartella
+source .venv/bin/activate
 ```
 
 ## Utilizzo
 
 ```bash
-# Milano (default)
+# Milano
 python genera_preventivi.py --input nuovi_lavori.csv --template milano
 
 # Liguria
