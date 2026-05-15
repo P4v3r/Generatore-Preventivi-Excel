@@ -247,9 +247,12 @@ def _build_workbook_zip(
     
     new_files['[Content_Types].xml'] = content_types.encode('utf-8')
 
-    # 6. Lascia il foglio Totale (sheet2.xml) identico al template - NON popolarlo
-    # Il foglio Totale deve rimanere vuoto come nel template originale
-    # (nessuna modifica necessaria - sheet2.xml è già copiato dal template)
+    # 6. Popola il foglio Totale (sheet2.xml) con i dati dei lavori
+    # Aggiunge righe con codice, data e riferimento a I8 del foglio lavoro
+    if 'xl/worksheets/sheet2.xml' in new_files:
+        sheet2_xml = new_files['xl/worksheets/sheet2.xml'].decode('utf-8')
+        sheet2_xml = _add_totale_rows(sheet2_xml, lavori)
+        new_files['xl/worksheets/sheet2.xml'] = sheet2_xml.encode('utf-8')
 
     # 8. Scrivi il nuovo ZIP
     temp_path = output_path.with_suffix('.build.xlsx')
@@ -446,6 +449,98 @@ def _insert_quantita_in_sheet(sheet_xml: str, codice_elanco: str, quantita: int)
         # Log per debug: codice non trovato
         import sys
         print(f"DEBUG: Codice elanco '{codice_elanco}' non trovato nel foglio. SHARED_STRINGS ha {len(SHARED_STRINGS)} elementi", file=sys.stderr)
+    
+    return sheet_xml
+
+
+def _add_totale_rows(sheet2_xml: str, lavori: List[Lavoro]) -> str:
+    """Popola il foglio Totale con una riga per ogni lavoro.
+    
+    Colonne:
+    - B: codice lavoro
+    - C: data esecuzione
+    - D: riferimento a I8 del foglio lavoro (es. ='TEST001'!I8)
+    
+    La riga 2 (formula SOMMA) e la riga 1 (intestazioni) non vengono modificate.
+    I dati iniziano da riga 3.
+    """
+    content = sheet2_xml
+    
+    for i, lavoro in enumerate(lavori):
+        row_num = 3 + i  # Riga 3 per primo lavoro, 4 per secondo, ecc.
+        
+        # B: codice lavoro (valore testuale)
+        content = _set_cell_value(content, f'B{row_num}', lavoro.codice)
+        
+        # C: data esecuzione
+        content = _set_cell_value(content, f'C{row_num}', lavoro.data_esecuzione)
+        
+        # D: formula riferimento a I8 del foglio lavoro
+        # La formula deve essere: ='CODICE'!I8
+        formula_value = f"='{lavoro.codice}'!I8"
+        content = _set_cell_formula(content, f'D{row_num}', formula_value)
+    
+    return content
+
+
+def _set_cell_formula(sheet_xml: str, cell_ref: str, formula: str) -> str:
+    """Imposta una formula in una cella nel foglio XML.
+    
+    Preserva stili esistenti. Se la cella ha già un valore, lo sostituisce con la formula.
+    """
+    # Check for self-closing cell first
+    self_closing_pattern = rf'<c r="{re.escape(cell_ref)}"([^>]*)/>'
+    self_closing_match = re.search(self_closing_pattern, sheet_xml)
+    
+    if self_closing_match:
+        attrs = self_closing_match.group(1)
+        self_closing = self_closing_match.group(0)
+        
+        # Get existing style
+        style_match = re.search(r's="(\d+)"', attrs)
+        style_attr = f' s="{style_match.group(1)}"' if style_match else ''
+        
+        new_cell = f'<c r="{cell_ref}"{style_attr}><f aca="false">{formula}</f><v>0</v></c>'
+        sheet_xml = sheet_xml.replace(self_closing, new_cell, 1)
+        return sheet_xml
+    
+    # Check for non-self-closing cell
+    non_self_pattern = rf'<c r="{re.escape(cell_ref)}"([^>]*)>'
+    non_self_match = re.search(non_self_pattern, sheet_xml)
+    
+    if non_self_match:
+        start_pos = non_self_match.end()
+        close_pos = sheet_xml.find('</c>', start_pos)
+        if close_pos == -1:
+            return sheet_xml
+        
+        open_tag_content = non_self_match.group(1)
+        cell_content = sheet_xml[start_pos:close_pos]
+        
+        # Get existing style
+        style_match = re.search(r's="(\d+)"', non_self_match.group(0))
+        style_attr = f' s="{style_match.group(1)}"' if style_match else ''
+        
+        # Build new cell with formula
+        old_cell = f'<c r="{cell_ref}"{open_tag_content}>{cell_content}</c>'
+        new_cell = f'<c r="{cell_ref}"{style_attr}><f aca="false">{formula}</f><v>0</v></c>'
+        
+        sheet_xml = sheet_xml.replace(old_cell, new_cell, 1)
+        return sheet_xml
+    
+    # Cell doesn't exist - insert it
+    row_num = int(re.search(r'(\d+)', cell_ref).group(1))
+    new_cell = f'<c r="{cell_ref}"><f aca="false">{formula}</f><v>0</v></c>'
+    
+    # Find the row
+    row_pattern = rf'(<row[^>]*r="{row_num}"[^>]*>)(.*?)(</row>)'
+    row_match = re.search(row_pattern, sheet_xml, re.DOTALL)
+    
+    if row_match:
+        row_content = row_match.group(2)
+        new_row_content = row_content + new_cell
+        new_row = row_match.group(1) + new_row_content + row_match.group(3)
+        sheet_xml = sheet_xml.replace(row_match.group(0), new_row)
     
     return sheet_xml
 
