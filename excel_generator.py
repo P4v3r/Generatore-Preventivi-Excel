@@ -13,10 +13,7 @@ from config import (
     OUTPUT_DIR,
     CELLS,
     COL_QUANTITA,
-    TOTALE_SHEET,
-    TOTALE_HEADER_ROWS,
     TEMPLATE_WORK_SHEET,
-    CELL_TOTALE,
 )
 from models import Lavoro, MatchResult
 
@@ -249,29 +246,12 @@ def _build_workbook_zip(
     content_types = content_types.replace('</Types>', new_overrides + '</Types>')
     
     new_files['[Content_Types].xml'] = content_types.encode('utf-8')
-    
-    # 6. Rimuovi stili indesiderati dalle celle compilabili dell'header
-    for filename in list(new_files.keys()):
-        if filename.startswith('xl/worksheets/sheet') and filename.endswith('.xml'):
-            content = new_files[filename].decode('utf-8')
-            # Rimuovi stile s="..." dalle celle vuote dell'header che causano bordi
-            content = _clear_cell_style(content, 'D3')
-            content = _clear_cell_style(content, 'D4')
-            content = _clear_cell_style(content, 'D5')
-            content = _clear_cell_style(content, 'D6')
-            content = _clear_cell_style(content, 'D7')
-            content = _clear_cell_style(content, 'G5')
-            content = _clear_cell_style(content, 'G6')
-            content = _clear_cell_style(content, 'G7')
-            new_files[filename] = content.encode('utf-8')
-    
-    # 7. Popola il foglio Totale (sheet2.xml) con le righe dei lavori
-    if 'xl/worksheets/sheet2.xml' in template_files:
-        totale_xml = template_files['xl/worksheets/sheet2.xml'].decode('utf-8')
-        totale_xml = _add_totale_rows(totale_xml, sheet_data_list)
-        new_files['xl/worksheets/sheet2.xml'] = totale_xml.encode('utf-8')
-    
-    # 7. Scrivi il nuovo ZIP
+
+    # 6. Lascia il foglio Totale (sheet2.xml) identico al template - NON popolarlo
+    # Il foglio Totale deve rimanere vuoto come nel template originale
+    # (nessuna modifica necessaria - sheet2.xml è già copiato dal template)
+
+    # 8. Scrivi il nuovo ZIP
     temp_path = output_path.with_suffix('.build.xlsx')
     with zipfile.ZipFile(temp_path, 'w', zipfile.ZIP_DEFLATED) as zout:
         for filename, data in new_files.items():
@@ -486,85 +466,6 @@ def _clear_cell_style(sheet_xml: str, cell_ref: str) -> str:
     
     sheet_xml = re.sub(cell_pattern, fix_cell, sheet_xml)
     return sheet_xml
-
-
-def _add_totale_rows(totale_xml: str, sheet_data_list: list) -> str:
-    """Aggiunge righe al foglio Totale con i dati dei lavori.
-    
-    Ogni riga contiene:
-    - B: codice lavoro
-    - C: data esecuzione
-    - D: riferimento al foglio lavoro (es: ='COD001'!I8)
-    
-    Le righe vengono aggiunte dopo la riga 3 (le prime 3 righe sono header).
-    """
-    # Trova l'ultima riga esistente nel foglio
-    row_pattern = r'<row r="(\d+)"'
-    existing_rows = list(re.finditer(row_pattern, totale_xml))
-    
-    # L'ultima riga usata è la 25 (B25, C25, D25) nel template base
-    # Aggiungiamo le nuove righe dopo la riga 2 (riga header) o l'ultima esistente
-    start_row = 3  # Partiamo dalla riga 3 per i dati
-    
-    # Costruisci le righe XML per ogni lavoro
-    new_rows_xml = ''
-    
-    for i, data in enumerate(sheet_data_list):
-        row_num = start_row + i
-        codice = data['codice']
-        data_esec = data['data_esecuzione']
-        
-        # Riferimento al foglio lavoro: ='COD001'!I8
-        # I8 è la cella del totale nel foglio lavoro
-        sheet_ref = f"'{codice}'!I8"
-        
-        # Stile per le celle (usa gli stili esistenti dalla riga 3 del template)
-        # B: s="124", C: s="125", D: s="126"
-        # Cella B: codice (stringa)
-        # Cella C: data esecuzione
-        # Cella D: formula riferimento
-        
-        # Formatta la data in formato Excel (seriale)
-        # Le date nel template sono trattate come seriali
-        data_formatted = _format_date_for_excel(data_esec)
-        
-        row_xml = f'''<row r="{row_num}" customFormat="false" ht="15.75" hidden="false" customHeight="false" outlineLevel="0" collapsed="false">
-<c r="B{row_num}" s="124" t="str"><v>{codice}</v></c>
-<c r="C{row_num}" s="125"><v>{data_formatted}</v></c>
-<c r="D{row_num}" s="126" t="str"><v>{sheet_ref}</v></c>
-</row>'''
-        new_rows_xml += row_xml
-    
-    # Inserisci le nuove righe prima di </sheetData>
-    totale_xml = totale_xml.replace('</sheetData>', new_rows_xml + '</sheetData>')
-    
-    return totale_xml
-
-
-def _format_date_for_excel(date_str: str) -> str:
-    """Converte una stringa data in numero seriale Excel.
-    
-    Excel memorizza le date come numero di giorni dal 1/1/1900.
-    """
-    from datetime import date, datetime
-    
-    if date_str is None:
-        return ""
-    
-    try:
-        # Prova diversi formati data
-        for fmt in ('%d/%m/%Y', '%Y-%m-%d', '%d-%m-%Y', '%Y/%m/%d'):
-            try:
-                dt = datetime.strptime(date_str, fmt)
-                # Calcola il numero seriale (giorni dal 1/1/1900 + 1 per bug Excel)
-                excel_epoch = date(1900, 1, 1)
-                delta = (dt.date() - excel_epoch).days + 2
-                return str(delta)
-            except ValueError:
-                continue
-        return date_str  # Ritorna originale se non parseable
-    except Exception:
-        return date_str
 
 
 def _fix_content_type(xlsx_path: Path):
