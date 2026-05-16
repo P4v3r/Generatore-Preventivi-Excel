@@ -196,9 +196,9 @@ def _build_workbook_zip(
         sheetId = 1 + i
         sheets_xml += f'<sheet name="{sheet_data_list[i]["codice"]}" sheetId="{sheetId}" state="visible" r:id="rId{10+i}"/>'
     
-    # Totale -> sheetId=n+1, rId4 (esistente)
+    # Totale -> sheetId=n+1, rId2 (esistente e punta a sheet2.xml)
     total_sheetId = 1 + len(sheet_data_list)
-    sheets_xml += f'<sheet name="Totale" sheetId="{total_sheetId}" state="visible" r:id="rId4"/>'
+    sheets_xml += f'<sheet name="Totale" sheetId="{total_sheetId}" state="visible" r:id="rId2"/>'
     
     sheets_xml += '</sheets>'
     
